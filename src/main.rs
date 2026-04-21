@@ -118,10 +118,14 @@ async fn main() -> Result<()> {
                 
                 match connect_with_retry().await {
                     Ok(mut socket) => {
-                        if let Err(e) = socket.reload_config().await {
-                            tracing::error!("Failed to reload config: {}", e);
-                        } else {
-                            tracing::info!("Theme switched to: {}", theme.file_name().unwrap_or_default().to_string_lossy());
+                        match socket.reload_config_with_event(2).await {
+                            Ok(_) => {
+                                tracing::info!("Theme switched to: {}", theme.file_name().unwrap_or_default().to_string_lossy());
+                            }
+                            Err(e) => {
+                                tracing::warn!("Config reload event: {}", e);
+                                tracing::info!("Theme applied: {}", theme.file_name().unwrap_or_default().to_string_lossy());
+                            }
                         }
                     }
                     Err(e) => {

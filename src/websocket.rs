@@ -27,6 +27,54 @@ pub struct GlazeSocket {
 }
 
 impl GlazeSocket {
+    /// Subscribe to events and wait for user_config_changed.
+    ///
+    /// This sends a subscribe command for user_config_changed and waits for the event.
+    /// Returns Ok(()) if the event is received, Err if timeout.
+    pub async fn wait_for_config_reload(&mut self, timeout_secs: u64) -> Result<()> {
+        let msg = Message::Text("subscribe user_config_changed".to_string());
+        self.write
+            .send(msg)
+            .await
+            .context("Failed to subscribe to user_config_changed")?;
+
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        if let Some(read) = self.read.take() {
+            let read = read;
+            tokio::pin!(read);
+
+            loop {
+                tokio::select! {
+                    result = tokio::time::timeout(timeout, read.next()) => {
+                        match result {
+                            Ok(Some(Ok(Message::Text(text)))) => {
+                                if text.contains("user_config_changed") {
+                                    tracing::info!("Received user_config_changed event");
+                                    return Ok(());
+                                }
+                            }
+                            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+                                break;
+                            }
+                            Err(_) => {
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        break;
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!("Timeout waiting for user_config_changed event");
+    }
+}
+
+impl GlazeSocket {
     /// Connect to GlazeWM's WebSocket server.
     ///
     /// # Errors
@@ -87,16 +135,74 @@ impl GlazeSocket {
         Ok(())
     }
 
-    /// Reload GlazeWM's configuration.
-    ///
-    /// This is a convenience method that sends the `wm-reload-config` command.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if sending the command fails.
-    pub async fn reload_config(&mut self) -> Result<()> {
-        self.send_command("wm-reload-config").await
+/// Reload GlazeWM's configuration.
+///
+/// This is a convenience method that sends the `wm-reload-config` command.
+///
+/// # Errors
+///
+/// Returns an error if sending the command fails.
+pub async fn reload_config(&mut self) -> Result<()> {
+    self.send_command("wm-reload-config").await
+}
+
+/// Reload config and wait for the event.
+///
+/// Subscribes to user_config_changed first, then sends reload command,
+/// and waits for the event to confirm reload completed.
+///
+/// # Errors
+///
+/// Returns an error if any step fails.
+pub async fn reload_config_with_event(&mut self, timeout_secs: u64) -> Result<()> {
+    // Subscribe first so we don't miss the event
+    let msg = Message::Text("subscribe user_config_changed".to_string());
+    self.write
+        .send(msg)
+        .await
+        .context("Failed to subscribe to user_config_changed")?;
+
+    // Small delay to ensure subscription is registered
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Send reload command
+    self.send_command("wm-reload-config").await?;
+
+    // Wait for the event
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    if let Some(read) = self.read.take() {
+        let read = read;
+        tokio::pin!(read);
+
+        loop {
+            tokio::select! {
+                result = tokio::time::timeout(timeout, read.next()) => {
+                    match result {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            if text.contains("user_config_changed") {
+                                tracing::info!("Received user_config_changed event");
+                                return Ok(());
+                            }
+                        }
+                        Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+                            break;
+                        }
+                        Err(_) => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep(timeout) => {
+                    break;
+                }
+            }
+        }
     }
+
+    anyhow::bail!("Timeout waiting for user_config_changed event");
+}
 
     /// Close the WebSocket connection gracefully.
     ///
