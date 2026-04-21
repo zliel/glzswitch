@@ -23,6 +23,7 @@ const GLAZEWM_WS_URL: &str = "ws://localhost:6123";
 /// to send commands. Only write operations are supported (sending commands).
 pub struct GlazeSocket {
     write: futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    read: Option<futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
 }
 
 impl GlazeSocket {
@@ -40,11 +41,11 @@ impl GlazeSocket {
             .await
             .context("Failed to connect to GlazeWM WebSocket")?;
 
-        let (write, _) = ws_stream.split();
+        let (write, read) = ws_stream.split();
 
         tracing::info!("Connected to GlazeWM WebSocket at {}", GLAZEWM_WS_URL);
 
-        Ok(GlazeSocket { write })
+        Ok(GlazeSocket { write, read: Some(read) })
     }
 
     /// Connect to a custom GlazeWM WebSocket URL.
@@ -61,11 +62,11 @@ impl GlazeSocket {
             .await
             .context("Failed to connect to GlazeWM WebSocket")?;
 
-        let (write, _) = ws_stream.split();
+        let (write, read) = ws_stream.split();
 
         tracing::info!("Connected to GlazeWM WebSocket at {}", url);
 
-        Ok(GlazeSocket { write })
+        Ok(GlazeSocket { write, read: Some(read) })
     }
 
     /// Send a command to GlazeWM.
@@ -109,6 +110,28 @@ impl GlazeSocket {
             .context("Failed to close WebSocket connection")?;
         tracing::info!("Closed GlazeWM WebSocket connection");
         Ok(())
+    }
+
+    /// Wait for the connection to be closed (i.e., GlazeWM has exited).
+    ///
+    /// This returns a future that completes when the WebSocket connection is closed,
+    /// which happens when GlazeWM exits.
+    pub async fn wait_for_close(&mut self) {
+        if let Some(read) = self.read.take() {
+            let mut read = read;
+            while let Some(msg) = read.next().await {
+                match msg {
+                    Ok(Message::Close(_)) | Err(_) => {
+                        tracing::info!("GlazeWM connection closed");
+                        break;
+                    }
+                    Ok(Message::Ping(data)) => {
+                        let _ = self.write.send(Message::Pong(data)).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 

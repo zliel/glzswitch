@@ -6,9 +6,9 @@ use std::sync::mpsc::channel;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
+use tokio::task::spawn;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-// Global flag for graceful shutdown
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 fn setup_ctrlc_handler() {
@@ -35,9 +35,29 @@ async fn connect_with_retry() -> anyhow::Result<websocket::GlazeSocket> {
     }
 }
 
+async fn monitor_glazewm_connection() {
+    loop {
+        if !RUNNING.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match websocket::GlazeSocket::connect().await {
+            Ok(mut socket) => {
+                tracing::info!("Monitoring GlazeWM connection...");
+                socket.wait_for_close().await;
+                tracing::info!("GlazeWM has exited, shutting down glzswitch...");
+                RUNNING.store(false, Ordering::SeqCst);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to GlazeWM for monitoring: {}", e);
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Setup logging (enable debug to see theme discovery details)
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(tracing_subscriber::EnvFilter::new("glzswitch=debug,info"))
@@ -45,20 +65,14 @@ async fn main() -> Result<()> {
 
     tracing::info!("glzswitch starting...");
 
-    // Setup Ctrl+C handler for graceful shutdown
     setup_ctrlc_handler();
 
-    // Initialize paths
     let paths = config::ConfigPaths::new()
         .context("Failed to determine config paths")?;
     
-    // Ensure themes directory exists
     config::ensure_themes_dir_exists(&paths)?;
-    
-    // Create default theme if needed
     config::create_default_theme_if_needed(&paths)?;
     
-    // Get theme files
     let themes = config::get_theme_files(&paths)
         .context("Failed to read theme files")?;
     
@@ -71,26 +85,22 @@ async fn main() -> Result<()> {
         tracing::info!("  - {}", theme.file_name().unwrap_or_default().to_string_lossy());
     }
     
-    // Initialize state
     let app_state = state::AppState::new(themes.len());
     
-    // Setup hotkey channel
     let (hotkey_tx, hotkey_rx) = channel();
     hotkey::start_hotkey_listener(hotkey_tx)
         .context("Failed to start hotkey listener")?;
     
-    // Main loop
+    let glazewm_monitor = spawn(monitor_glazewm_connection());
+    
     loop {
-        // Check for shutdown signal
         if !RUNNING.load(Ordering::SeqCst) {
             tracing::info!("Shutting down...");
             break Ok(());
         }
-
-        // Wait for hotkey with timeout so we can check RUNNING flag
+    
         match hotkey_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(_) => {
-                // Check for shutdown signal after receiving hotkey
                 if !RUNNING.load(Ordering::SeqCst) {
                     tracing::info!("Shutting down...");
                     break Ok(());
@@ -98,17 +108,14 @@ async fn main() -> Result<()> {
                 
                 tracing::info!("Hotkey triggered, switching theme...");
                 
-                // Get next theme index
                 let index = app_state.advance();
                 let theme = &themes[index];
                 
-                // Swap theme
                 if let Err(e) = config::swap_theme(theme, &paths.glazewm_config) {
                     tracing::error!("Failed to swap theme: {}", e);
                     continue;
                 }
                 
-                // Reload GlazeWM config via WebSocket (with retry)
                 match connect_with_retry().await {
                     Ok(mut socket) => {
                         if let Err(e) = socket.reload_config().await {
@@ -123,7 +130,6 @@ async fn main() -> Result<()> {
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Timeout is expected - just loop again to check RUNNING flag
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
