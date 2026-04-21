@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     config::ensure_themes_dir_exists(&paths)?;
     config::create_default_theme_if_needed(&paths)?;
     
-    let themes = config::get_theme_files(&paths)
+    let themes = config::get_themes(&paths)
         .context("Failed to read theme files")?;
     
     if themes.is_empty() {
@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
                 let index = app_state.advance();
                 let theme = &themes[index];
                 
-                if let Err(e) = config::swap_theme(theme, &paths.glazewm_config) {
+                if let Err(e) = config::swap_theme(theme, &paths) {
                     tracing::error!("Failed to swap theme: {}", e);
                     continue;
                 }

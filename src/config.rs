@@ -1,20 +1,27 @@
 //! Configuration module for glzswitch.
 //! Handles theme discovery, management, and swapping for GlazeWM configurations.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const GLAZEWM_CONFIG: &str = "config.yaml";
+const TACKY_BORDERS_CONFIG: &str = "config.yaml";
 const THEMES_DIR: &str = "themes";
+const GLAZE_FILE: &str = "glaze.yaml";
+const TACKY_BORDERS_FILE: &str = "tacky-borders.yaml";
 
-/// Paths configuration for glzswitch themes and GlazeWM config.
+/// Paths configuration for glzswitch themes and config files.
 pub struct ConfigPaths {
     /// Directory containing theme files (~/.config/glzswitch/themes/)
     pub theme_dir: PathBuf,
     /// Path to the active GlazeWM config (~/.glzr/glazewm/config.yaml)
     pub glazewm_config: PathBuf,
+    /// Tacky-borders config directory (~/.config/tacky-borders/)
+    pub tacky_borders_dir: Option<PathBuf>,
+    /// Tacky-borders config file path (~/.config/tacky-borders/config.yaml)
+    pub tacky_borders_config: Option<PathBuf>,
 }
 
 impl ConfigPaths {
@@ -34,9 +41,18 @@ impl ConfigPaths {
             .join("glazewm")
             .join(GLAZEWM_CONFIG);
 
+        // Detect tacky-borders config directory (~/.config/tacky-borders/)
+        let tacky_borders_dir = dirs::home_dir().map(|h| h.join(".config").join("tacky-borders"));
+
+        let tacky_borders_config = tacky_borders_dir
+            .as_ref()
+            .map(|d| d.join(TACKY_BORDERS_CONFIG));
+
         Some(ConfigPaths {
             theme_dir,
             glazewm_config,
+            tacky_borders_dir,
+            tacky_borders_config,
         })
     }
 
@@ -60,36 +76,34 @@ impl ConfigPaths {
 
         None
     }
+
+    /// Check if tacky-borders config directory exists
+    pub fn has_tacky_borders(&self) -> bool {
+        self.tacky_borders_dir
+            .as_ref()
+            .map(|d| d.exists())
+            .unwrap_or(false)
+    }
 }
 
-/// Discover all theme files (.yaml and .yml) in the themes directory.
+/// Discover all theme subdirectory in the themes directory.
 ///
 /// # Errors
 /// Returns an error if the themes directory cannot be read.
-pub fn get_theme_files(paths: &ConfigPaths) -> Result<Vec<PathBuf>> {
+pub fn get_themes(paths: &ConfigPaths) -> Result<Vec<PathBuf>> {
     tracing::debug!("Scanning theme directory: {}", paths.theme_dir.display());
+
+    if !paths.theme_dir.exists() {
+        return Ok(vec![]);
+    }
 
     let mut themes: Vec<PathBuf> = fs::read_dir(&paths.theme_dir)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| {
-            let is_yaml = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext == "yaml" || ext == "yml")
-                .unwrap_or(false);
-
-            tracing::debug!(
-                "  {} - is_file: {}, is_yaml: {}",
-                path.display(),
-                path.is_file(),
-                is_yaml
-            );
-            path.is_file() && is_yaml
-        })
+        .filter(|path| path.is_dir())
         .collect();
 
-    tracing::info!("Discovered {} theme files", themes.len());
+    tracing::info!("Discovered {} themes", themes.len());
     for theme in &themes {
         tracing::info!(
             "  - {}",
@@ -113,76 +127,143 @@ pub fn ensure_themes_dir_exists(paths: &ConfigPaths) -> Result<()> {
     Ok(())
 }
 
-/// Create a default theme by copying the existing GlazeWM config.
+/// Create a default theme by copying the existing configs.
 ///
 /// This should be called on first run when no themes exist.
+/// Saves the user's current GlazeWM and tacky-borders configs to a "user-default" theme.
 /// Returns true if a default theme was created, false otherwise.
 ///
 /// # Errors
 /// Returns an error if file operations fail.
 pub fn create_default_theme_if_needed(paths: &ConfigPaths) -> Result<bool> {
-    let themes = get_theme_files(paths)?;
+    let themes = get_themes(paths)?;
 
     if themes.is_empty() {
-        // Try to find an existing GlazeWM config
-        let config_path = paths
-            .resolve_glazewm_config()
-            .unwrap_or_else(|| paths.glazewm_config.clone());
+        // Create user-default theme from existing configs
+        let default_theme_dir = paths.theme_dir.join("user-default");
 
-        if config_path.exists() {
-            let default_theme = paths.theme_dir.join("default.yaml");
-            fs::copy(&config_path, &default_theme)?;
+        // Ensure theme directory exists
+        fs::create_dir_all(&default_theme_dir)?;
+
+        let mut created_any = false;
+
+        // Copy GlazeWM config if it exists
+        let glazewm_source = paths.glazewm_config.clone();
+        if glazewm_source.exists() {
+            let target = default_theme_dir.join(GLAZE_FILE);
+            fs::copy(&glazewm_source, &target)?;
             tracing::info!(
-                "Created default theme from existing config: {}",
-                default_theme.display()
+                "Created default theme from existing GlazeWM config: {}",
+                target.display()
             );
-            return Ok(true);
+            created_any = true;
         } else {
             tracing::warn!(
                 "No existing GlazeWM config found at: {}",
-                config_path.display()
+                glazewm_source.display()
             );
         }
+
+        // Copy tacky-borders config if directory exists
+        if paths.has_tacky_borders() {
+            if let Some(ref source) = paths.tacky_borders_config {
+                if source.exists() {
+                    let target = default_theme_dir.join(TACKY_BORDERS_FILE);
+                    fs::copy(source, &target)?;
+                    tracing::info!(
+                        "Created default theme from existing tacky-borders config: {}",
+                        target.display()
+                    );
+                    created_any = true;
+                }
+            }
+        }
+
+        return Ok(created_any);
     }
 
     Ok(false)
 }
 
-/// Swap the active GlazeWM config with a theme file.
+/// Swap the active configs with a theme.
 ///
-/// Copies the source theme to the target location.
-/// Ensures source exists before attempting the copy.
+/// Copies the source theme files to the target locations.
+/// - glaze.yaml -> ~/.glzr/glazewm/config.yaml
+/// - tacky-borders.yaml -> ~/.config/tacky-borders/config.yaml (if both exist)
 ///
 /// # Arguments
-/// * `source` - Path to the new theme file
-/// * `target` - Path where the theme should be applied (usually the GlazeWM config)
+/// * `theme_dir` - Path to the theme directory
+/// * `paths` - Configuration paths containing target locations
 ///
 /// # Errors
 /// Returns an error if file operations fail.
-pub fn swap_theme(source: &Path, target: &Path) -> Result<()> {
-    // First ensure source exists
-    if !source.exists() {
-        anyhow::bail!("Source theme not found: {}", source.display());
+fn copy_with_retry(source: &Path, target: &Path, max_retries: u32) -> Result<()> {
+    for attempt in 0..max_retries {
+        if target.exists() {
+            let _ = fs::remove_file(target);
+        }
+
+        match fs::copy(source, target) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < max_retries - 1 && e.raw_os_error() == Some(32) => {
+                tracing::warn!(
+                    "File locked, retrying (attempt {}/{})...",
+                    attempt + 1,
+                    max_retries
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(e).context(format!(
+                    "Failed to copy {} to {}",
+                    source.display(),
+                    target.display()
+                ))
+            }
+        }
     }
-
-    // Copy to target (overwrite)
-    fs::copy(source, target)?;
-
-    tracing::info!(
-        "Applied theme: {} -> {}",
-        source.display(),
-        target.display()
-    );
     Ok(())
 }
 
-/// Apply a theme by name to GlazeWM.
+pub fn swap_theme(theme_dir: &Path, paths: &ConfigPaths) -> Result<()> {
+    // Swap GlazeWM config (glaze.yaml -> config.yaml)
+    let glaze_source = theme_dir.join(GLAZE_FILE);
+    if !glaze_source.exists() {
+        anyhow::bail!("Theme GlazeWM config not found: {}", glaze_source.display());
+    }
+
+    copy_with_retry(&glaze_source, &paths.glazewm_config, 5)?;
+    tracing::info!(
+        "Applied GlazeWM config: {} -> {}",
+        glaze_source.display(),
+        paths.glazewm_config.display()
+    );
+
+    // Swap tacky-borders config if theme has it and target dir exists
+    if paths.has_tacky_borders() {
+        let tacky_source = theme_dir.join(TACKY_BORDERS_FILE);
+        if tacky_source.exists() {
+            if let Some(ref target) = paths.tacky_borders_config {
+                copy_with_retry(&tacky_source, target, 5)?;
+                tracing::info!(
+                    "Applied tacky-borders config: {} -> {}",
+                    tacky_source.display(),
+                    target.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply a theme by name to both GlazeWM and tacky-borders.
 ///
-/// Convenience function that resolves the theme name to a file path.
+/// Convenience function that resolves the theme name to a directory path.
 ///
 /// # Arguments
 /// * `paths` - Configuration paths
-/// * `theme_name` - Name of the theme (without extension)
+/// * `theme_name` - Name of the theme (directory name)
 ///
 /// # Errors
 /// Returns an error if the theme doesn't exist or swap fails.
@@ -192,19 +273,16 @@ pub fn apply_theme_by_name(paths: &ConfigPaths, theme_name: &str) -> Result<()> 
         anyhow::bail!("Invalid theme name: contains path traversal characters");
     }
 
-    let theme_file = paths.theme_dir.join(format!("{}.yaml", theme_name));
+    let theme_dir = paths.theme_dir.join(theme_name);
 
-    if !theme_file.exists() {
+    if !theme_dir.is_dir() {
         anyhow::bail!("Theme not found: {}", theme_name);
     }
 
-    swap_theme(&theme_file, &paths.glazewm_config)?;
+    swap_theme(&theme_dir, paths)?;
 
-    // Also save a copy in themes directory as "active.yaml" for reference
-    let active_theme = paths.theme_dir.join("active.yaml");
-    let _ = fs::remove_file(&active_theme);
-    fs::copy(&theme_file, &active_theme)?;
-
+    // Also save a copy in themes directory as "active" symlink or marker
+    // For simplicity, just log the active theme
     tracing::info!("Applied theme: {}", theme_name);
     Ok(())
 }
