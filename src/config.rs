@@ -11,6 +11,7 @@ const TACKY_BORDERS_CONFIG: &str = "config.yaml";
 const THEMES_DIR: &str = "themes";
 const GLAZE_FILE: &str = "glaze.yaml";
 const TACKY_BORDERS_FILE: &str = "tacky-borders.yaml";
+const CURRENT_THEME_FILE: &str = "current_theme.txt";
 
 /// Paths configuration for glzswitch themes and config files.
 pub struct ConfigPaths {
@@ -283,6 +284,86 @@ pub fn swap_theme(theme_dir: &Path, paths: &ConfigPaths) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Get the currently active theme name from the marker file.
+///
+/// Returns None if no theme has been set yet.
+pub fn get_current_theme(paths: &ConfigPaths) -> Option<String> {
+    let marker_file = paths.theme_dir.join(CURRENT_THEME_FILE);
+    if marker_file.exists() {
+        fs::read_to_string(&marker_file)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    }
+}
+
+/// Set the currently active theme name in the marker file.
+pub fn set_current_theme(paths: &ConfigPaths, theme_name: &str) -> Result<()> {
+    let marker_file = paths.theme_dir.join(CURRENT_THEME_FILE);
+    fs::write(&marker_file, theme_name)?;
+    tracing::info!("Set current theme to: {}", theme_name);
+    Ok(())
+}
+
+/// Save the current live configs (GlazeWM + Tacky-Borders) to a theme.
+///
+/// If `theme_name` is provided, saves to that theme (creates if doesn't exist).
+/// If `theme_name` is None, saves to the currently active theme.
+///
+/// Returns the theme name that was saved to.
+pub fn save_current_theme(paths: &ConfigPaths, theme_name: Option<&str>) -> Result<String> {
+    let target_theme = match theme_name {
+        Some(name) => name.to_string(),
+        None => match get_current_theme(paths) {
+            Some(current) => current,
+            None => {
+                anyhow::bail!("No active theme set. Provide a theme name to save to, or switch to a theme first.");
+            }
+        },
+    };
+
+    let target_dir = paths.theme_dir.join(&target_theme);
+    if !target_dir.exists() {
+        fs::create_dir_all(&target_dir)?;
+        tracing::info!("Created new theme directory: {}", target_dir.display());
+    }
+
+    let mut saved_any = false;
+
+    // Save GlazeWM config
+    let glazewm_source = paths.resolve_glazewm_config();
+    if let Some(ref source) = glazewm_source {
+        if source.exists() {
+            let target = target_dir.join(GLAZE_FILE);
+            fs::copy(source, &target)?;
+            tracing::info!("Saved GlazeWM config to: {}", target.display());
+            saved_any = true;
+        }
+    } else {
+        tracing::warn!("Could not find GlazeWM config to save");
+    }
+
+    // Save Tacky-Borders config
+    if paths.has_tacky_borders() {
+        if let Some(ref source) = paths.tacky_borders_config {
+            if source.exists() {
+                let target = target_dir.join(TACKY_BORDERS_FILE);
+                fs::copy(source, &target)?;
+                tracing::info!("Saved Tacky-Borders config to: {}", target.display());
+                saved_any = true;
+            }
+        }
+    }
+
+    if !saved_any {
+        anyhow::bail!("No configs found to save");
+    }
+
+    Ok(target_theme)
 }
 
 /// Apply a theme by name to both GlazeWM and tacky-borders.

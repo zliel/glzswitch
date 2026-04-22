@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use glzswitch::{config, hotkey, state, websocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
@@ -8,6 +9,42 @@ use std::time::Duration;
 use tokio::task::spawn;
 use tokio::time::sleep;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[cfg(windows)]
+fn try_attach_console() {
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
+    
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AttachConsole(dwProcessId: u32) -> i32;
+        }
+        
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn try_attach_console() {
+    // No-op on non-Windows
+}
+
+#[derive(Parser)]
+#[command(name = "glzswitch")]
+#[command(about = "Theme switcher for GlazeWM and Tacky-Borders")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Save current live configs to a theme
+    Save {
+        /// Optional theme name. If not provided, saves to currently active theme.
+        theme_name: Option<String>,
+    },
+}
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -59,10 +96,40 @@ async fn monitor_glazewm_connection() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    try_attach_console();
+
+    // Check for help flags before any initialization
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "-h" {
+        println!("Theme switcher for GlazeWM and Tacky-Borders\n\nUsage: glzswitch.exe [COMMAND]\n\nCommands:\n  save  Save current live configs to a theme\n  help  Print this message\n\nOptions:\n  -h, --help  Print help");
+        return Ok(());
+    }
+    if args.len() == 3 && args[1] == "save" && args[2] == "-h" {
+        println!("Save current live configs to a theme\n\nUsage: glzswitch.exe save [THEME_NAME]\n\nArguments:\n  [THEME_NAME]  Optional theme name. If not provided, saves to currently active theme");
+        return Ok(());
+    }
+
+    let cli = Cli::parse();
+
+    // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(tracing_subscriber::EnvFilter::new("glzswitch=debug,info"))
         .init();
+
+    // Handle CLI commands (save, etc) - these run without daemon
+    if let Some(command) = &cli.command {
+        let paths = config::ConfigPaths::new().context("Failed to determine config paths")?;
+        config::ensure_themes_dir_exists(&paths)?;
+        
+        match command {
+            Commands::Save { theme_name } => {
+                let saved_to = config::save_current_theme(&paths, theme_name.as_deref())?;
+                println!("Saved current configs to theme: {}", saved_to);
+                return Ok(());
+            }
+        }
+    }
 
     tracing::info!("glzswitch starting...");
 
@@ -79,6 +146,18 @@ async fn main() -> Result<()> {
         anyhow::bail!("No theme files found in {}", paths.theme_dir.display());
     }
 
+    if config::get_current_theme(&paths).is_none() {
+        if let Some(first_theme) = themes.first() {
+            let theme_name = first_theme.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "user-default".to_string());
+            if let Err(e) = config::set_current_theme(&paths, &theme_name) {
+                tracing::warn!("Failed to set initial current theme: {}", e);
+            }
+            tracing::info!("Set initial current theme: {}", theme_name);
+        }
+    }
+
     tracing::info!("Found {} themes", themes.len());
     for theme in &themes {
         tracing::info!(
@@ -92,7 +171,7 @@ async fn main() -> Result<()> {
     let (hotkey_tx, hotkey_rx) = channel();
     hotkey::start_hotkey_listener(hotkey_tx).context("Failed to start hotkey listener")?;
 
-    let glazewm_monitor = spawn(monitor_glazewm_connection());
+    let _glazewm_monitor = spawn(monitor_glazewm_connection());
 
     loop {
         if !RUNNING.load(Ordering::SeqCst) {
@@ -117,10 +196,17 @@ async fn main() -> Result<()> {
 
                 let index = app_state.advance();
                 let theme = &themes[index];
+                let theme_name = theme.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
 
                 if let Err(e) = config::swap_theme(theme, &paths) {
                     tracing::error!("Failed to swap theme: {}", e);
                     continue;
+                }
+
+                if let Err(e) = config::set_current_theme(&paths, &theme_name) {
+                    tracing::warn!("Failed to set current theme marker: {}", e);
                 }
 
                 match connect_with_retry().await {
