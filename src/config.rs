@@ -199,26 +199,37 @@ pub fn create_default_theme_if_needed(paths: &ConfigPaths) -> Result<bool> {
 /// Returns an error if file operations fail.
 fn copy_with_retry(source: &Path, target: &Path, max_retries: u32) -> Result<()> {
     for attempt in 0..max_retries {
+        // Delete target first to ensure file watcher detects change
         if target.exists() {
-            let _ = fs::remove_file(target);
+            if let Err(e) = fs::remove_file(target) {
+                if attempt < max_retries - 1 {
+                    tracing::warn!("Failed to delete target, retrying: {}", e);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                return Err(e).context(format!("Failed to delete {}", target.display()));
+            }
         }
 
         match fs::copy(source, target) {
             Ok(_) => return Ok(()),
-            Err(e) if attempt < max_retries - 1 && e.raw_os_error() == Some(32) => {
+            Err(e) if attempt < max_retries - 1 => {
                 tracing::warn!(
-                    "File locked, retrying (attempt {}/{})...",
+                    "Copy failed (attempt {}/{}): {}",
                     attempt + 1,
-                    max_retries
+                    max_retries,
+                    e
                 );
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    (100 * (attempt + 1)) as u64,
+                ));
             }
             Err(e) => {
                 return Err(e).context(format!(
                     "Failed to copy {} to {}",
                     source.display(),
                     target.display()
-                ))
+                ));
             }
         }
     }
@@ -226,7 +237,6 @@ fn copy_with_retry(source: &Path, target: &Path, max_retries: u32) -> Result<()>
 }
 
 pub fn swap_theme(theme_dir: &Path, paths: &ConfigPaths) -> Result<()> {
-    // Swap GlazeWM config (glaze.yaml -> config.yaml)
     let glaze_source = theme_dir.join(GLAZE_FILE);
     if !glaze_source.exists() {
         anyhow::bail!("Theme GlazeWM config not found: {}", glaze_source.display());
@@ -239,18 +249,36 @@ pub fn swap_theme(theme_dir: &Path, paths: &ConfigPaths) -> Result<()> {
         paths.glazewm_config.display()
     );
 
-    // Swap tacky-borders config if theme has it and target dir exists
     if paths.has_tacky_borders() {
         let tacky_source = theme_dir.join(TACKY_BORDERS_FILE);
+        tracing::info!(
+            "Tacky-borders source: {} (exists: {})",
+            tacky_source.display(),
+            tacky_source.exists()
+        );
         if tacky_source.exists() {
             if let Some(ref target) = paths.tacky_borders_config {
-                copy_with_retry(&tacky_source, target, 5)?;
+                tracing::info!(
+                    "Applying tacky-borders: {} -> {}",
+                    tacky_source.display(),
+                    target.display()
+                );
+                copy_with_retry(&tacky_source, target, 10)?;
                 tracing::info!(
                     "Applied tacky-borders config: {} -> {}",
                     tacky_source.display(),
                     target.display()
                 );
             }
+        } else {
+            tracing::info!(
+                "No tacky-borders config in theme: {}",
+                tacky_source.display()
+            );
+        }
+    } else {
+        if let Some(ref dir) = paths.tacky_borders_dir {
+            tracing::info!("Tacky-borders dir does not exist: {}", dir.display());
         }
     }
 
