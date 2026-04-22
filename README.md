@@ -29,6 +29,10 @@ A Rust utility for switching [GlazeWM](https://github.com/glzr-io/glazewm) and [
 
 3. The binary will be available at `target/release/glzswitch.exe`
 
+### Todo: Cargo Install
+
+Currently this is only available to be built from source, but I plan to add a GitHub Actions workflow to automatically build and attach the latest release binary and make it available in releases and through cargo for easy installation.
+
 ## Theme Directory Structure
 
 Themes are stored in subdirectories under `%appdata%/glzswitch/themes/<theme_name>/`:
@@ -53,14 +57,23 @@ Each theme is a subdirectory containing:
 
 ## Usage
 
-### Running the Application
+### CLI Commands
 
 ```bash
+# Start the theme switcher daemon (runs in background, listens for hotkey)
+glzswitch.exe
+
+# Show help
+glzswitch.exe -h
+
+# Save current configs to the currently active theme
+glzswitch.exe save
+
+# Save current configs to a specific theme (creates if it doesn't exist)
+glzswitch.exe save my-custom-theme
+
 # Run in debug mode (see detailed logs)
 cargo run --features console
-
-# Run the release build
-./target/release/glzswitch.exe
 ```
 
 ### Configuration
@@ -96,7 +109,7 @@ Note: There's a 1500ms cooldown between hotkey presses to prevent issues with ra
 
 glzswitch uses a specific approach to theme swapping that is necessary for Tacky-Borders to recognize configuration changes:
 
-1. **First Run**: Creates a `user-default` theme with copies of your current GlazeWM and Tacky-Borders configs. Note that currently this only happens once, but will be changed in a future update.
+1. **First Run**: Creates a `user-default` theme with copies of your current GlazeWM and Tacky-Borders configs.
 
 2. **Subsequent Swaps**:
    - Deletes the existing config file in the target config directory
@@ -105,7 +118,21 @@ glzswitch uses a specific approach to theme swapping that is necessary for Tacky
 
 The delete + rename pattern ensures the file watcher for Tacky-Borders detects the change.
 
-NOTE: Currently this does not backup the existing config before overwriting, so be sure to save your current configs if you want to preserve them. The `user-default` theme is created on first run to provide a backup of your current configs, but any changes made to the configs after that won't be preserved unless you manually back them up. This will be addressed in a near-future update to back up the existing config before overwriting.
+### Preserving Your Customizations
+
+If you make changes to your GlazeWM or Tacky-Borders configs and want to preserve them:
+
+```bash
+# Save current configs to the currently active theme
+glzswitch.exe save
+
+# Or save to a specific theme (creates it if it doesn't exist)
+glzswitch.exe save my-custom-theme
+```
+
+This copies your live configs back to the theme template, so they'll be preserved on future theme switches.
+
+Tip: To avoid having to use those commands or having your edits get overwritten, edit your theme files in `%appdata%/glzswitch/themes/<theme-name>/` rather than the live config directories.
 
 ## Troubleshooting
 
