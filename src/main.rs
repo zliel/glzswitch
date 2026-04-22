@@ -2,11 +2,11 @@
 
 use anyhow::{Context, Result};
 use glzswitch::{config, hotkey, state, websocket};
-use std::sync::mpsc::channel;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::channel;
 use std::time::Duration;
-use tokio::time::sleep;
 use tokio::task::spawn;
+use tokio::time::sleep;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -15,13 +15,14 @@ fn setup_ctrlc_handler() {
     ctrlc::set_handler(|| {
         tracing::info!("Received Ctrl+C, shutting down...");
         RUNNING.store(false, Ordering::SeqCst);
-    }).expect("Failed to set Ctrl+C handler");
+    })
+    .expect("Failed to set Ctrl+C handler");
 }
 
 async fn connect_with_retry() -> anyhow::Result<websocket::GlazeSocket> {
     let mut attempts = 0;
     let max_attempts = 3;
-    
+
     loop {
         match websocket::GlazeSocket::connect().await {
             Ok(socket) => return Ok(socket),
@@ -67,67 +68,79 @@ async fn main() -> Result<()> {
 
     setup_ctrlc_handler();
 
-    let paths = config::ConfigPaths::new()
-        .context("Failed to determine config paths")?;
-    
+    let paths = config::ConfigPaths::new().context("Failed to determine config paths")?;
+
     config::ensure_themes_dir_exists(&paths)?;
     config::create_default_theme_if_needed(&paths)?;
-    
-    let themes = config::get_themes(&paths)
-        .context("Failed to read theme files")?;
-    
+
+    let themes = config::get_themes(&paths).context("Failed to read theme files")?;
+
     if themes.is_empty() {
         anyhow::bail!("No theme files found in {}", paths.theme_dir.display());
     }
-    
+
     tracing::info!("Found {} themes", themes.len());
     for theme in &themes {
-        tracing::info!("  - {}", theme.file_name().unwrap_or_default().to_string_lossy());
+        tracing::info!(
+            "  - {}",
+            theme.file_name().unwrap_or_default().to_string_lossy()
+        );
     }
-    
+
     let app_state = state::AppState::new(themes.len());
-    
+
     let (hotkey_tx, hotkey_rx) = channel();
-    hotkey::start_hotkey_listener(hotkey_tx)
-        .context("Failed to start hotkey listener")?;
-    
+    hotkey::start_hotkey_listener(hotkey_tx).context("Failed to start hotkey listener")?;
+
     let glazewm_monitor = spawn(monitor_glazewm_connection());
-    
+
     loop {
         if !RUNNING.load(Ordering::SeqCst) {
             tracing::info!("Shutting down...");
             break Ok(());
         }
-    
+
         match hotkey_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(_) => {
                 if !RUNNING.load(Ordering::SeqCst) {
                     tracing::info!("Shutting down...");
                     break Ok(());
                 }
-                
+
                 tracing::info!("Hotkey triggered, switching theme...");
-                
+
+                const COOLDOWN: Duration = Duration::from_millis(1500);
+                if app_state.is_in_cooldown(COOLDOWN) {
+                    tracing::info!("Theme switch on cooldown, skipping...");
+                    continue;
+                }
+
                 let index = app_state.advance();
                 let theme = &themes[index];
-                
+
                 if let Err(e) = config::swap_theme(theme, &paths) {
                     tracing::error!("Failed to swap theme: {}", e);
                     continue;
                 }
-                
+
                 match connect_with_retry().await {
-                    Ok(mut socket) => {
-                        match socket.reload_config_with_event(2).await {
-                            Ok(_) => {
-                                tracing::info!("Theme switched to: {}", theme.file_name().unwrap_or_default().to_string_lossy());
-                            }
-                            Err(e) => {
-                                tracing::warn!("Config reload event: {}", e);
-                                tracing::info!("Theme applied: {}", theme.file_name().unwrap_or_default().to_string_lossy());
-                            }
+                    Ok(mut socket) => match socket.reload_config_with_event(2).await {
+                        Ok(_) => {
+                            app_state.record_switch();
+                            tracing::info!(
+                                "Theme switched to: {}",
+                                theme.file_name().unwrap_or_default().to_string_lossy()
+                            );
                         }
-                    }
+                        Err(e) => {
+                            app_state.record_switch();
+                            tracing::warn!("Config reload event: {}", e);
+                            tracing::info!(
+                                "Theme applied: {}",
+                                theme.file_name().unwrap_or_default().to_string_lossy()
+                            );
+                        }
+                    },
                     Err(e) => {
                         tracing::error!("Failed to connect to GlazeWM: {}", e);
                     }
