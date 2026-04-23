@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Thread-safe application state for tracking current theme index.
 ///
@@ -9,6 +10,8 @@ pub struct AppState {
     current_index: AtomicUsize,
     /// The total number of themes available.
     theme_count: usize,
+    /// Timestamp of last theme switch (in milliseconds since epoch)
+    last_switch: AtomicU64,
 }
 
 impl AppState {
@@ -23,7 +26,37 @@ impl AppState {
         AppState {
             current_index: AtomicUsize::new(0),
             theme_count,
+            last_switch: AtomicU64::new(0),
         }
+    }
+
+    /// Check if we're still in cooldown period.
+    ///
+    /// # Arguments
+    /// * `cooldown` - The cooldown duration to check against
+    ///
+    /// # Returns
+    /// true if cooldown has not elapsed since last switch
+    pub fn is_in_cooldown(&self, cooldown: Duration) -> bool {
+        let last = self.last_switch.load(Ordering::SeqCst);
+        if last == 0 {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let elapsed = now.saturating_sub(last);
+        elapsed < u64::try_from(cooldown.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Record that a theme switch occurred.
+    pub fn record_switch(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_switch.store(now, Ordering::SeqCst);
     }
 
     /// Calculates the next theme index without advancing.

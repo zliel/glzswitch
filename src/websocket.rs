@@ -23,6 +23,55 @@ const GLAZEWM_WS_URL: &str = "ws://localhost:6123";
 /// to send commands. Only write operations are supported (sending commands).
 pub struct GlazeSocket {
     write: futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    read: Option<futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+}
+
+impl GlazeSocket {
+    /// Subscribe to events and wait for user_config_changed.
+    ///
+    /// This sends a subscribe command for user_config_changed and waits for the event.
+    /// Returns Ok(()) if the event is received, Err if timeout.
+    pub async fn wait_for_config_reload(&mut self, timeout_secs: u64) -> Result<()> {
+        let msg = Message::Text("subscribe user_config_changed".to_string());
+        self.write
+            .send(msg)
+            .await
+            .context("Failed to subscribe to user_config_changed")?;
+
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        if let Some(read) = self.read.take() {
+            let read = read;
+            tokio::pin!(read);
+
+            loop {
+                tokio::select! {
+                    result = tokio::time::timeout(timeout, read.next()) => {
+                        match result {
+                            Ok(Some(Ok(Message::Text(text)))) => {
+                                if text.contains("user_config_changed") {
+                                    tracing::info!("Received user_config_changed event");
+                                    return Ok(());
+                                }
+                            }
+                            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+                                break;
+                            }
+                            Err(_) => {
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        break;
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!("Timeout waiting for user_config_changed event");
+    }
 }
 
 impl GlazeSocket {
@@ -40,11 +89,11 @@ impl GlazeSocket {
             .await
             .context("Failed to connect to GlazeWM WebSocket")?;
 
-        let (write, _) = ws_stream.split();
+        let (write, read) = ws_stream.split();
 
         tracing::info!("Connected to GlazeWM WebSocket at {}", GLAZEWM_WS_URL);
 
-        Ok(GlazeSocket { write })
+        Ok(GlazeSocket { write, read: Some(read) })
     }
 
     /// Connect to a custom GlazeWM WebSocket URL.
@@ -61,11 +110,11 @@ impl GlazeSocket {
             .await
             .context("Failed to connect to GlazeWM WebSocket")?;
 
-        let (write, _) = ws_stream.split();
+        let (write, read) = ws_stream.split();
 
         tracing::info!("Connected to GlazeWM WebSocket at {}", url);
 
-        Ok(GlazeSocket { write })
+        Ok(GlazeSocket { write, read: Some(read) })
     }
 
     /// Send a command to GlazeWM.
@@ -86,16 +135,74 @@ impl GlazeSocket {
         Ok(())
     }
 
-    /// Reload GlazeWM's configuration.
-    ///
-    /// This is a convenience method that sends the `wm-reload-config` command.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if sending the command fails.
-    pub async fn reload_config(&mut self) -> Result<()> {
-        self.send_command("wm-reload-config").await
+/// Reload GlazeWM's configuration.
+///
+/// This is a convenience method that sends the `wm-reload-config` command.
+///
+/// # Errors
+///
+/// Returns an error if sending the command fails.
+pub async fn reload_config(&mut self) -> Result<()> {
+    self.send_command("wm-reload-config").await
+}
+
+/// Reload config and wait for the event.
+///
+/// Subscribes to user_config_changed first, then sends reload command,
+/// and waits for the event to confirm reload completed.
+///
+/// # Errors
+///
+/// Returns an error if any step fails.
+pub async fn reload_config_with_event(&mut self, timeout_secs: u64) -> Result<()> {
+    // Subscribe first so we don't miss the event
+    let msg = Message::Text("subscribe user_config_changed".to_string());
+    self.write
+        .send(msg)
+        .await
+        .context("Failed to subscribe to user_config_changed")?;
+
+    // Small delay to ensure subscription is registered
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Send reload command
+    self.send_command("wm-reload-config").await?;
+
+    // Wait for the event
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    if let Some(read) = self.read.take() {
+        let read = read;
+        tokio::pin!(read);
+
+        loop {
+            tokio::select! {
+                result = tokio::time::timeout(timeout, read.next()) => {
+                    match result {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            if text.contains("user_config_changed") {
+                                tracing::info!("Received user_config_changed event");
+                                return Ok(());
+                            }
+                        }
+                        Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+                            break;
+                        }
+                        Err(_) => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep(timeout) => {
+                    break;
+                }
+            }
+        }
     }
+
+    anyhow::bail!("Timeout waiting for user_config_changed event");
+}
 
     /// Close the WebSocket connection gracefully.
     ///
@@ -109,6 +216,28 @@ impl GlazeSocket {
             .context("Failed to close WebSocket connection")?;
         tracing::info!("Closed GlazeWM WebSocket connection");
         Ok(())
+    }
+
+    /// Wait for the connection to be closed (i.e., GlazeWM has exited).
+    ///
+    /// This returns a future that completes when the WebSocket connection is closed,
+    /// which happens when GlazeWM exits.
+    pub async fn wait_for_close(&mut self) {
+        if let Some(read) = self.read.take() {
+            let mut read = read;
+            while let Some(msg) = read.next().await {
+                match msg {
+                    Ok(Message::Close(_)) | Err(_) => {
+                        tracing::info!("GlazeWM connection closed");
+                        break;
+                    }
+                    Ok(Message::Ping(data)) => {
+                        let _ = self.write.send(Message::Pong(data)).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
